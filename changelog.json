@@ -3,10 +3,14 @@
     "version": "1.0.0",
     "date": "2026-10-19",
     "title": "Initial release",
-    "description": "First release of Vault Secrets.",
+    "description": "Use HashiCorp Vault secrets in requests as {{vault.path#field}}, resolved at send time.",
     "changes": {
       "Added": [
-        "Initial plugin scaffold"
+        "{{vault.*}} references resolved from HashiCorp Vault (KV v1 and v2) when a request is sent",
+        "Settings tab with connection test; token encrypted with the OS keychain",
+        "Per-environment overrides via VAULT_ADDR, VAULT_TOKEN, VAULT_NAMESPACE and VAULT_MOUNT",
+        "Short-lived secret cache (configurable, can be turned off)",
+        "Error toasts explaining why a secret could not be read"
       ]
     }
   }

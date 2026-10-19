@@ -1,157 +1,84 @@
-# Vault Secrets
+# Vault Secrets for Voiden
 
-Resolve {{vault.*}} secrets from HashiCorp Vault at request time, so they never live in your project files
-
-A [Voiden](https://voiden.md) plugin, scaffolded with [`@voiden/create-plugin`](https://github.com/VoidenHQ/create-plugin).
-
-## Getting started
-
-```sh
-npm install
-```
-
-Then load it into Voiden in one of two ways.
-
-**Plugin Dev Mode (recommended while developing)**
-
-1. Open this folder as a project in Voiden.
-2. Click the **puzzle icon** in the top bar. A floating dev toolbar appears.
-3. Press **Run** (▶). Voiden builds the plugin and loads it.
-4. A welcome tab opens. That's `src/WelcomePage.tsx` running inside Voiden.
-
-With **live reload** on (⚡, the default), every save rebuilds and reloads the plugin. **Rebuild** (⟳) does it on demand, **Stop** (■) unloads it, and **Show details** shows the build log.
-
-**Install from a zip**
-
-```sh
-npm run build
-npm run zip
-```
-
-In Voiden: **Extensions → ⋯ → Install from file → `dist/voiden-vault-secrets.zip`**.
-
-React, `@voiden/sdk` and the editor libraries are provided by Voiden at runtime. `build.mjs` maps those imports to Voiden's copies, so they're never bundled.
-
-## Project layout
+Use secrets from [HashiCorp Vault](https://www.vaultproject.io/) in your Voiden requests without storing them in your project.
 
 ```
-manifest.json            Plugin id, name, version, permissions (read by Voiden)
-changelog.json           Release history, shown in the extension details panel
-package.json             Scripts and dev dependencies
-build.mjs                Renderer bundle: src/plugin.ts → dist/voiden-vault-secrets.js
-build-main.mjs           Main-process bundle (skipped if src/main-process.ts is absent)
-zip.mjs                  Packages dist/ into an installable zip
-generate-manifest.mjs    Writes dist/manifest.json for releases (inlines a local icon)
-.github/workflows/
-  release.yml            Builds and publishes a GitHub release when you push a v* tag
-src/
-  plugin.ts              Entry point: onload / onunload
-  WelcomePage.tsx        Example React component shown in a tab
-  skill.md               Describes the plugin to Voiden's AI features
+Authorization: Bearer {{vault.myapp/api#token}}
 ```
 
-## How a plugin works
+Secrets are read from Vault when a request is sent, in Voiden's main process. They never reach the editor UI, the project's files, or Git.
 
-`src/plugin.ts` default-exports a function. Voiden calls it with a `context` object and expects `onload`, `onunload` and `metadata` back. Everything your plugin adds to Voiden goes through `context`.
+> **Requires a Voiden version with the plugin variable provider API** (`env.registerVariableProvider`). On older versions the plugin loads, but `{{vault.*}}` references stay unresolved and the settings page shows a warning.
 
-The starter does two things in `onload`:
+## Setup
 
-- registers a **top-bar button** (`context.registerTopBarItem`)
-- opens a **welcome tab** (`context.addTab`) rendering `src/WelcomePage.tsx`
+1. Install the plugin, then click the key icon in the top bar to open **Vault Secrets**.
+2. Enter your **Vault address** and a **token**, then **Save** and **Test connection**.
 
-Replace those with your own features. The commented examples in `src/plugin.ts` cover custom blocks, slash commands, sidebar tabs and request pipeline hooks.
+The token is encrypted with your OS keychain (macOS Keychain, Windows DPAPI, libsecret on Linux). If OS encryption isn't available, the token is kept in memory until Voiden quits and is never written to disk in plain text.
 
-## Examples
+| Setting | Default | |
+|---|---|---|
+| Vault address | — | e.g. `https://vault.example.com:8200` |
+| Token | — | needs `read` on the secrets you reference |
+| KV mount | `secret` | |
+| KV version | v2 | v1 is supported too |
+| Namespace | — | Vault Enterprise / HCP only |
+| Default secret path | — | used by bare references like `{{vault.api_key}}` |
+| Cache | 60 s | how long a secret is reused before it's read again; `0` turns caching off |
 
-### A tab with a React component
+## Reference syntax
 
-```tsx
-context.addTab('main', {
-  id: 'voiden-vault-secrets-tab',              // same id = focus the existing tab
-  title: 'My Tab',
-  icon: 'Rocket',                // lucide icon name (or an icon component), shown on the tab
-  props: {},
-  component: MyComponent,
-});
-```
-
-Open tabs survive a plugin reload (live reload, Rebuild), but their components don't. Register the component in `onload` as well, with the same id, so an open tab keeps rendering instead of showing "Panel component not available":
-
-```ts
-context.registerPanel('main', { id: 'my-plugin-tab', title: 'My Tab', icon: 'Rocket', component: MyComponent });
-```
-
-### A sidebar tab
-
-```ts
-context.registerSidebarTab('right', {
-  id: 'voiden-vault-secrets-sidebar',
-  title: 'My Panel',
-  icon: 'Rocket',                // any lucide-react icon name
-  component: MyPanel,
-});
-```
-
-### Slash commands in .void files
-
-```ts
-context.addVoidenSlashGroup({
-  name: 'voiden-vault-secrets',
-  title: 'Vault Secrets',
-  commands: [
-    {
-      name: 'hello',
-      slash: '/hello',
-      label: 'Insert hello',
-      description: 'Insert a hello paragraph',
-      action: (editor) => editor.chain().focus().insertContent('Hello!').run(),
-    },
-  ],
-});
-```
-
-### Command palette (needs the `commandPalette` permission)
-
-```ts
-context.registerCommand({
-  id: 'voiden-vault-secrets.say-hello',
-  label: 'Vault Secrets: Say hello',
-  action: () => context.ui.showToast?.('Hello!', 'info'),
-});
-```
-
-### Workspace events (needs the `events` permission)
-
-```ts
-const off = context.events.on('tab:changed', ({ tabId }) => console.log(tabId));
-// call off() in onunload
-```
-
-### Theme-aware styling
-
-`context.theme` holds class names that follow the user's theme, for example `context.theme.bg.panel`, `context.theme.text.muted` and `context.theme.button.primary`. Use them instead of hard-coded colours. `src/WelcomePage.tsx` shows them in use.
-
-## Permissions
-
-Some APIs only work when listed in `manifest.json` under `permissions`. Without one, the call throws and Voiden shows a "Needs Permission" badge on the plugin.
-
-| Permission | Unlocks |
+| Reference | Reads |
 |---|---|
-| `commandPalette` | `context.registerCommand` |
-| `contextMenus` | `context.registerContextMenu` |
-| `events` | `context.events.on` |
-| `filesystem` | `context.fs.*` (files in the active project) |
-| `settings` | `context.ui.registerSettings`, `context.settings.*` |
+| `{{vault.myapp/db#password}}` | field `password` of secret `myapp/db` |
+| `{{vault.myapp/api_key}}` | field `api_key` of secret `myapp` |
+| `{{vault.api_key}}` | field `api_key` of the default secret path |
 
-## Releasing
+`#` always marks the field. Without it, the last path segment is the field.
 
-1. Bump `version` in `manifest.json` and `package.json`, and add an entry to `changelog.json`.
-2. Commit, then tag and push:
+If a secret can't be read (no access, field missing, Vault unreachable), Voiden blocks the request as having an unresolved variable, and a toast explains what went wrong. Nothing is sent with a placeholder in it.
 
-   ```sh
-   git tag v1.0.0
-   git push --tags
-   ```
+## Per-environment Vaults
 
-   `.github/workflows/release.yml` builds the plugin and creates a GitHub release with `dist/voiden-vault-secrets.js`, `dist/manifest.json` and `changelog.json` attached.
-3. To list the plugin in Voiden's Extensions panel, open a pull request to the [Voiden plugin registry](https://github.com/VoidenHQ/plugin-registry) adding a `"type": "community"` entry that points at your repository.
+These variables in the active Voiden environment override the saved settings:
+
+| Variable | Overrides |
+|---|---|
+| `VAULT_ADDR` | Vault address |
+| `VAULT_TOKEN` | token |
+| `VAULT_NAMESPACE` | namespace |
+| `VAULT_MOUNT` | KV mount |
+
+For example, `staging` can point at a different Vault than `dev`. Keep `VAULT_TOKEN` in a **private** environment, never a public one.
+
+## Development
+
+```bash
+npm install
+npm test          # unit tests
+npm run build     # dist/voiden-vault-secrets.js + dist/voiden-vault-secrets-main.cjs
+npm run zip       # dist/voiden-vault-secrets.zip
+```
+
+To develop it live, open this folder as a project in Voiden, turn on **Plugin Dev Mode** (puzzle icon), and press **Run**.
+
+To install the zip: **Extensions → ⋯ → Install from file → `dist/voiden-vault-secrets.zip`**.
+
+| File | |
+|---|---|
+| `src/main-process.ts` | registers the `vault` provider and the settings IPC handlers |
+| `src/resolver.ts` | reference → secret value, with caching and environment overrides |
+| `src/vaultClient.ts` | Vault HTTP calls (KV v1/v2, token lookup) |
+| `src/configStore.ts` | settings and encrypted token storage |
+| `src/plugin.ts`, `src/SettingsPage.tsx` | top-bar button, settings tab, `{{vault.*}}` highlighting, error toasts |
+
+## Roadmap
+
+- Doppler and Infisical providers
+- A secret path browser
+- Other auth methods (AppRole, OIDC)
+
+## License
+
+Apache-2.0
