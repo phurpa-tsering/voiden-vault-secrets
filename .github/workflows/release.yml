@@ -1,0 +1,42 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build renderer bundle
+        run: node build.mjs
+
+      - name: Build main-process bundle
+        run: node build-main.mjs
+
+      - name: Generate manifest
+        # Inlines any local icon as base64 → writes dist/manifest.json
+        run: node generate-manifest.mjs
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/manifest.json
+            changelog.json
+            dist/voiden-vault-secrets.js
+            src/skill.md
+            dist/voiden-vault-secrets-main.cjs

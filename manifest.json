@@ -1,0 +1,18 @@
+{
+  "id": "voiden-vault-secrets",
+  "name": "Vault Secrets",
+  "description": "Resolve {{vault.*}} secrets from HashiCorp Vault at request time, so they never live in your project files",
+  "version": "1.0.0",
+  "voidenVersion": ">=2.3.0",
+  "author": "Phurpa Tsering",
+  "icon": "KeyRound",
+  "type": "community",
+  "priority": 30,
+  "readme": "Resolve {{vault.*}} secrets from HashiCorp Vault at request time, so they never live in your project files",
+  "mainProcess": true,
+  "permissions": [
+    "settings"
+  ],
+  "capabilities": {},
+  "features": []
+}

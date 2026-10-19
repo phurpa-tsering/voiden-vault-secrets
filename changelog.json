@@ -1,0 +1,13 @@
+[
+  {
+    "version": "1.0.0",
+    "date": "2026-10-19",
+    "title": "Initial release",
+    "description": "First release of Vault Secrets.",
+    "changes": {
+      "Added": [
+        "Initial plugin scaffold"
+      ]
+    }
+  }
+]
