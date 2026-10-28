@@ -1,7 +1,7 @@
 [
   {
     "version": "1.0.0",
-    "date": "2026-10-19",
+    "date": "2026-10-28",
     "title": "Initial release",
     "description": "Use HashiCorp Vault secrets in requests as {{vault.path#field}}, resolved at send time.",
     "changes": {
