@@ -1,207 +1,269 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { CorePluginContext } from '@voiden/sdk/ui';
+import { PROVIDERS, providerInfo, type ProviderId } from './catalog';
+import type { ConfigView, Draft, ProviderStatus, TestResult } from './types';
+import { BrowseTab } from './ui/BrowseTab';
+import { ConnectionTab } from './ui/ConnectionTab';
+import { Icon } from './ui/icons';
+import { ipc, isConfigured, isDirty, providerState, STATE_LABEL, Spinner, type Toast } from './ui/shared';
+import { STYLES } from './ui/styles';
+import { UsageTab } from './ui/UsageTab';
 
-// Mirrors VaultSettings in resolver.ts (kept separate so the renderer bundle
-// doesn't pull in main-process code).
-interface VaultSettings {
-  address: string;
-  namespace: string;
-  mount: string;
-  kvVersion: 1 | 2;
-  defaultPath: string;
-  cacheTtlSeconds: number;
+export { VaultIcon } from './ui/icons';
+
+type TabId = 'connection' | 'browse' | 'usage';
+
+const STATUS_CHANNEL = 'ext:voiden-vault-secrets:status';
+const EMPTY_DRAFT: Draft = { settings: {}, secrets: {} };
+
+// Survives the tab being closed and reopened within a session.
+let lastSelection: { provider?: ProviderId; tab: TabId } = { tab: 'connection' };
+
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** What gets sent to test/browse: the form's settings plus any typed secrets. */
+function draftToSend(config: ConfigView, id: ProviderId, draft: Draft): Draft {
+  return {
+    settings: { ...config.providers[id].settings, ...draft.settings },
+    secrets: Object.fromEntries(Object.entries(draft.secrets).filter(([, v]) => v !== '')),
+  };
 }
 
-interface ConfigState {
-  settings: VaultSettings;
-  hasToken: boolean;
-  tokenPersisted: boolean;
-  encryptionAvailable: boolean;
-  providerAvailable: boolean;
-  envOverrides: Record<string, string>;
-}
+function CacheControl({ config, toast, onChange }: { config: ConfigView; toast: Toast; onChange(next: ConfigView): void }) {
+  const [value, setValue] = useState(String(config.cacheTtlSeconds));
+  useEffect(() => setValue(String(config.cacheTtlSeconds)), [config.cacheTtlSeconds]);
 
-type TestResult = { ok: true; displayName: string; policies: string[]; ttl: number } | { ok: false; message: string };
+  const commit = async () => {
+    const seconds = Math.max(0, Math.floor(Number(value) || 0));
+    setValue(String(seconds));
+    if (seconds === config.cacheTtlSeconds) return;
+    onChange(await ipc('save-general', { cacheTtlSeconds: seconds }));
+    toast(seconds ? `Secrets are cached for ${seconds} s` : 'Secret caching turned off', 'info');
+  };
 
-export const ipc = (channel: string, ...args: any[]) =>
-  (window as any).electron?.ipc?.invoke(`ext:voiden-vault-secrets:${channel}`, ...args);
-
-/** Vault key icon, used for the top-bar button and the tab. */
-export function VaultIcon({ size = 14 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-      <path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" />
-      <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
-    </svg>
+    <div className="vs-cachebar" title="How long a secret is reused before it's fetched again. 0 turns caching off.">
+      <span className="vs-muted vs-small">Cache</span>
+      <input
+        className="vs-input"
+        type="number"
+        min={0}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+      />
+      <span className="vs-muted vs-small">s</span>
+      <button
+        type="button"
+        className="vs-btn vs-btn-sm"
+        title="Forget every cached secret, e.g. right after rotating one"
+        onClick={async () => {
+          await ipc('clear-cache');
+          toast('Secret cache cleared', 'info');
+        }}
+      >
+        Clear
+      </button>
+    </div>
   );
 }
 
-const join = (...classes: string[]) => classes.join(' ');
-
-function formatTtl(seconds: number): string {
-  if (!seconds) return 'never expires';
-  if (seconds < 3600) return `expires in ${Math.round(seconds / 60)} min`;
-  if (seconds < 86400) return `expires in ${Math.round(seconds / 3600)} h`;
-  return `expires in ${Math.round(seconds / 86400)} days`;
-}
-
 export function createSettingsPage(context: CorePluginContext) {
-  const t = context.theme;
+  const toast: Toast = (message, type = 'info') => context.ui.showToast?.(message, type);
 
   return function SettingsPage() {
-    const [config, setConfig] = useState<ConfigState | null>(null);
-    const [draft, setDraft] = useState<VaultSettings | null>(null);
-    const [tokenInput, setTokenInput] = useState('');
-    const [saving, setSaving] = useState(false);
-    const [testing, setTesting] = useState(false);
-    const [testResult, setTestResult] = useState<TestResult | null>(null);
+    const [config, setConfig] = useState<ConfigView | null>(null);
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [selected, setSelected] = useState<ProviderId>(lastSelection.provider ?? 'vault');
+    const [tab, setTab] = useState<TabId>(lastSelection.tab);
+    const [drafts, setDrafts] = useState<Partial<Record<ProviderId, Draft>>>({});
+    const [tests, setTests] = useState<Partial<Record<ProviderId, TestResult | 'pending'>>>({});
 
     useEffect(() => {
-      ipc('get-config').then((c: ConfigState) => {
-        setConfig(c);
-        setDraft(c.settings);
-      });
+      ipc('get-config')
+        .then((c: ConfigView) => {
+          setConfig(c);
+          // First visit: open the first provider that's set up.
+          if (!lastSelection.provider) setSelected(PROVIDERS.find((p) => isConfigured(c, p.id))?.id ?? 'vault');
+        })
+        .catch((error) => setLoadError(errorText(error)));
+
+      const onStatus = (_event: unknown, payload: { provider: ProviderId; status: ProviderStatus }) =>
+        setConfig((c) => (c ? { ...c, status: { ...c.status, [payload.provider]: payload.status } } : c));
+      const bridge = (window as any).electron?.ipc;
+      bridge?.on(STATUS_CHANNEL, onStatus);
+      return () => bridge?.removeListener(STATUS_CHANNEL, onStatus);
     }, []);
 
-    if (!config || !draft) {
-      return <div className={join(t.bg.editor, t.text.muted)} style={{ padding: 24, height: '100%' }}>Loading…</div>;
-    }
+    useEffect(() => {
+      lastSelection = { provider: selected, tab };
+    }, [selected, tab]);
 
-    const set = <K extends keyof VaultSettings>(key: K, value: VaultSettings[K]) => setDraft({ ...draft, [key]: value });
+    const draftFor = (id: ProviderId) => drafts[id] ?? EMPTY_DRAFT;
 
-    const save = async (token?: string | null) => {
-      setSaving(true);
+    const runTest = useCallback(
+      async (id: ProviderId, draft: Draft) => {
+        if (!config) return;
+        setTests((t) => ({ ...t, [id]: 'pending' }));
+        const result: TestResult = await ipc('test-connection', id, draftToSend(config, id, draft)).catch((error) => ({
+          ok: false,
+          message: errorText(error),
+        }));
+        setTests((t) => ({ ...t, [id]: result }));
+      },
+      [config],
+    );
+
+    const save = async (id: ProviderId) => {
+      if (!config || !isDirty(config, id, drafts[id])) return;
+      const toSave = draftToSend(config, id, draftFor(id));
       try {
-        const next: Omit<ConfigState, 'providerAvailable' | 'envOverrides'> = await ipc('save-config', draft, token);
-        setConfig({ ...config, ...next });
-        setTokenInput('');
-        setTestResult(null);
-        context.ui.showToast?.('Vault settings saved', 'success');
+        const next: ConfigView = await ipc('save-provider', id, toSave.settings, toSave.secrets);
+        setConfig(next);
+        setDrafts(({ [id]: _, ...rest }) => rest);
+        toast(`${providerInfo(id).name} settings saved`, 'success');
+        if (isConfigured(next, id)) {
+          setTests((t) => ({ ...t, [id]: 'pending' }));
+          const result: TestResult = await ipc('test-connection', id, draftToSend(next, id, EMPTY_DRAFT));
+          setTests((t) => ({ ...t, [id]: result }));
+        }
       } catch (error) {
-        context.ui.showToast?.(`Couldn't save Vault settings: ${error instanceof Error ? error.message : String(error)}`, 'error');
-      } finally {
-        setSaving(false);
+        toast(`Couldn't save: ${errorText(error)}`, 'error');
       }
     };
 
-    const test = async () => {
-      setTesting(true);
-      setTestResult(await ipc('test-connection'));
-      setTesting(false);
-    };
+    if (!config) {
+      return (
+        <div className="vs-root">
+          <style>{STYLES}</style>
+          <div className="vs-empty vs-muted" style={{ height: '100%', justifyContent: 'center' }}>
+            {loadError ? <>Couldn't load Vault Secrets: {loadError}</> : <><Spinner size={18} /> Loading…</>}
+          </div>
+        </div>
+      );
+    }
 
-    const inputStyle = { width: '100%', padding: '6px 8px', borderRadius: 6, borderWidth: 1, fontSize: 13, fontFamily: 'monospace' } as const;
-    const inputClass = join(t.bg.panel, t.border.DEFAULT, t.text.primary);
-    const label = (text: string, hint?: string) => (
-      <div style={{ marginBottom: 4 }}>
-        <span style={{ fontSize: 13, fontWeight: 500 }}>{text}</span>
-        {hint && <span className={t.text.muted} style={{ fontSize: 12, marginLeft: 6 }}>{hint}</span>}
-      </div>
-    );
-    const button = (text: string, onClick: () => void, opts: { primary?: boolean; disabled?: boolean } = {}) => (
-      <button
-        onClick={onClick}
-        disabled={opts.disabled}
-        className={opts.primary ? join(t.button.primary, 'text-white') : join(t.bg.panel, t.border.DEFAULT, t.text.primary)}
-        style={{ padding: '6px 14px', borderRadius: 6, fontSize: 13, borderWidth: opts.primary ? 0 : 1, cursor: opts.disabled ? 'default' : 'pointer', opacity: opts.disabled ? 0.6 : 1 }}
-      >
-        {text}
-      </button>
-    );
+    const info = providerInfo(selected);
+    const { state, status } = providerState(config, selected);
+    const configured = isConfigured(config, selected);
+    const dirty = isDirty(config, selected, drafts[selected]);
+    const test = tests[selected];
 
     return (
-      <div className={join(t.bg.editor, t.text.primary)} style={{ height: '100%', overflowY: 'auto' }}>
-        <div style={{ maxWidth: 640, margin: '0 auto', padding: '32px 24px', display: 'flex', flexDirection: 'column', gap: 18 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span className={t.text.accent}><VaultIcon size={22} /></span>
-            <h1 style={{ fontSize: 20, fontWeight: 600, margin: 0 }}>Vault Secrets</h1>
-          </div>
-          <p className={t.text.muted} style={{ fontSize: 13, margin: 0 }}>
-            Reference secrets as <code>{'{{vault.path#field}}'}</code> in any request. They're read from Vault when the
-            request is sent and never stored in your project.
-          </p>
-
-          {!config.providerAvailable && (
-            <div className={join(t.bg.panel, t.border.DEFAULT)} style={{ borderWidth: 1, borderRadius: 6, padding: 12, fontSize: 13 }}>
-              ⚠️ This version of Voiden can't resolve plugin variables yet, so <code>{'{{vault.*}}'}</code> references won't
-              work. Update Voiden to use this plugin.
-            </div>
-          )}
-
-          <div>
-            {label('Vault address', `or ${config.envOverrides.address} in your environment`)}
-            <input className={inputClass} style={inputStyle} placeholder="https://vault.example.com:8200" value={draft.address} onChange={(e) => set('address', e.target.value)} />
-          </div>
-
-          <div>
-            {label('Token', config.hasToken ? (config.tokenPersisted ? 'saved, encrypted' : 'set for this session only') : 'not set')}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <input
-                type="password"
-                autoComplete="off"
-                className={inputClass}
-                style={inputStyle}
-                placeholder={config.hasToken ? '•••••••• (enter a new token to replace)' : 'hvs.…'}
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-              />
-              {config.hasToken && button('Remove', () => save(null), { disabled: saving })}
-            </div>
-            {!config.encryptionAvailable && (
-              <div className={t.text.muted} style={{ fontSize: 12, marginTop: 4 }}>
-                OS encryption isn't available, so the token is kept in memory until Voiden quits. Alternatively set {config.envOverrides.token} in a private environment.
+      <div
+        className="vs-root"
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's' && tab === 'connection') {
+            e.preventDefault();
+            e.stopPropagation();
+            save(selected);
+          }
+        }}
+      >
+        <style>{STYLES}</style>
+        <div className="vs-shell">
+          <header className="vs-header">
+            <div className="vs-logo"><Icon name="key" size={20} /></div>
+            <div className="vs-grow" style={{ minWidth: 240 }}>
+              <h1 className="vs-title">Vault Secrets</h1>
+              <div className="vs-muted" style={{ marginTop: 4 }}>
+                Reference secrets from your secret manager in any request. They're fetched when the request is sent and never
+                written to your project.
               </div>
-            )}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-            <div>
-              {label('KV mount', 'default "secret"')}
-              <input className={inputClass} style={inputStyle} value={draft.mount} onChange={(e) => set('mount', e.target.value)} />
             </div>
-            <div>
-              {label('KV version')}
-              <select className={inputClass} style={inputStyle} value={draft.kvVersion} onChange={(e) => set('kvVersion', Number(e.target.value) === 1 ? 1 : 2)}>
-                <option value={2}>v2 (versioned)</option>
-                <option value={1}>v1</option>
-              </select>
-            </div>
-            <div>
-              {label('Namespace', 'Enterprise / HCP only')}
-              <input className={inputClass} style={inputStyle} placeholder="admin" value={draft.namespace} onChange={(e) => set('namespace', e.target.value)} />
-            </div>
-            <div>
-              {label('Cache (seconds)', '0 = off')}
-              <input type="number" min={0} className={inputClass} style={inputStyle} value={draft.cacheTtlSeconds} onChange={(e) => set('cacheTtlSeconds', Math.max(0, Number(e.target.value) || 0))} />
-            </div>
-          </div>
+            <CacheControl config={config} toast={toast} onChange={setConfig} />
+          </header>
 
-          <div>
-            {label('Default secret path', 'used by {{vault.name}} without a path')}
-            <input className={inputClass} style={inputStyle} placeholder="myapp/dev" value={draft.defaultPath} onChange={(e) => set('defaultPath', e.target.value)} />
-          </div>
-
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {button(saving ? 'Saving…' : 'Save', () => save(tokenInput ? tokenInput : undefined), { primary: true, disabled: saving })}
-            {button(testing ? 'Testing…' : 'Test connection', test, { disabled: testing || saving })}
-            {button('Clear cache', async () => { await ipc('clear-cache'); context.ui.showToast?.('Vault cache cleared', 'info'); })}
-          </div>
-
-          {testResult && (
-            <div className={join(t.bg.panel, t.border.DEFAULT)} style={{ borderWidth: 1, borderRadius: 6, padding: 12, fontSize: 13 }}>
-              {testResult.ok
-                ? <>✅ Connected{testResult.displayName ? ` as ${testResult.displayName}` : ''} · {formatTtl(testResult.ttl)}{testResult.policies.length ? ` · policies: ${testResult.policies.join(', ')}` : ''}</>
-                : <>❌ {testResult.message}</>}
-              <div className={t.text.muted} style={{ fontSize: 12, marginTop: 4 }}>Tests the saved settings — save first if you changed them.</div>
+          {!config.providerApiAvailable && (
+            <div className="vs-warning">
+              <Icon name="alert" size={16} />
+              <span>
+                This version of Voiden can't resolve plugin variables yet, so secret references won't work in requests. Update
+                Voiden to use this plugin.
+              </span>
             </div>
           )}
 
-          <div className={t.text.muted} style={{ fontSize: 12, lineHeight: 1.6 }}>
-            <div style={{ fontWeight: 500, marginBottom: 2 }}>Reference syntax</div>
-            <code>{'{{vault.myapp/db#password}}'}</code> — field <code>password</code> of secret <code>myapp/db</code><br />
-            <code>{'{{vault.myapp/api_key}}'}</code> — field <code>api_key</code> of secret <code>myapp</code><br />
-            <code>{'{{vault.api_key}}'}</code> — field <code>api_key</code> of the default secret path<br />
-            Per environment, {Object.values(config.envOverrides).join(', ')} override these settings.
+          <div className="vs-layout">
+            <nav className="vs-nav" aria-label="Secret providers">
+              <div className="vs-nav-label vs-muted">Providers</div>
+              {PROVIDERS.map((p) => {
+                const s = providerState(config, p.id);
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className="vs-nav-item"
+                    aria-current={p.id === selected}
+                    title={s.status?.message ?? STATE_LABEL[s.state]}
+                    onClick={() => setSelected(p.id)}
+                  >
+                    <span className="vs-dot" data-state={s.state} />
+                    <span className="vs-grow">
+                      <span className="vs-nav-name" style={{ display: 'block' }}>{p.name}</span>
+                      <span className="vs-nav-ns vs-mono vs-muted" style={{ display: 'block' }}>{`{{${p.namespace}.*}}`}</span>
+                    </span>
+                    {isDirty(config, p.id, drafts[p.id]) && <span className="vs-unsaved" title="Unsaved changes" />}
+                  </button>
+                );
+              })}
+            </nav>
+
+            <section className="vs-card" aria-label={info.name}>
+              <div className="vs-card-head">
+                <div className="vs-grow">
+                  <div className="vs-row" style={{ flexWrap: 'wrap' }}>
+                    <h2 className="vs-card-title">{info.name}</h2>
+                    <span className="vs-pill" data-state={state} title={status?.message}>
+                      <span className="vs-dot" data-state={state} />
+                      {STATE_LABEL[state]}
+                    </span>
+                  </div>
+                  <div className="vs-muted" style={{ marginTop: 2 }}>
+                    {info.tagline} · <span className="vs-mono vs-small">{info.pattern}</span>
+                  </div>
+                  {state === 'error' && status && !test && (
+                    <div className="vs-small" style={{ marginTop: 6, color: 'var(--status-error)' }}>{status.message}</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="vs-tabs" role="tablist">
+                {(['connection', 'browse', 'usage'] as const).map((t) => (
+                  <button key={t} type="button" role="tab" className="vs-tab" aria-selected={tab === t} onClick={() => setTab(t)}>
+                    {t === 'connection' ? 'Connection' : t === 'browse' ? 'Browse secrets' : 'How to use'}
+                  </button>
+                ))}
+              </div>
+
+              {tab === 'connection' && (
+                <ConnectionTab
+                  key={selected}
+                  id={selected}
+                  config={config}
+                  draft={draftFor(selected)}
+                  dirty={dirty}
+                  test={test}
+                  toast={toast}
+                  onChange={(d) => setDrafts((all) => ({ ...all, [selected]: d }))}
+                  onDiscard={() => setDrafts(({ [selected]: _, ...rest }) => rest)}
+                  onSave={() => save(selected)}
+                  onTest={() => runTest(selected, draftFor(selected))}
+                />
+              )}
+              {tab === 'browse' && (
+                <BrowseTab
+                  key={selected}
+                  id={selected}
+                  draft={draftToSend(config, selected, draftFor(selected))}
+                  configured={configured || dirty}
+                  toast={toast}
+                  onGoToConnection={() => setTab('connection')}
+                />
+              )}
+              {tab === 'usage' && <UsageTab id={selected} toast={toast} />}
+            </section>
           </div>
         </div>
       </div>

@@ -1,89 +1,109 @@
 /**
- * Persists Vault settings in Voiden's userData folder. The token is encrypted
- * with Electron's safeStorage (macOS Keychain / Windows DPAPI / libsecret) and
- * never leaves the main process. When OS encryption isn't available the token
- * is kept in memory for the session only — never written in plain text.
+ * Persists provider settings in Voiden's userData folder. Secret fields
+ * (tokens, client secrets, database passwords) are encrypted with Electron's
+ * safeStorage (macOS Keychain / Windows DPAPI / libsecret) and never leave the
+ * main process. When OS encryption isn't available they are kept in memory
+ * for the session only — never written in plain text.
  */
 
 import { app, safeStorage } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_SETTINGS, type VaultSettings } from './resolver';
-
-interface StoredConfig {
-  settings: Partial<VaultSettings>;
-  /** base64 of safeStorage.encryptString(token) */
-  encryptedToken?: string;
-}
+import { PROVIDERS, providerInfo, sanitizeSettings, type ProviderId } from './catalog';
+import { migrateConfig, sanitizeTtl, type StoredConfig } from './configModel';
+import type { SecretsStore } from './service';
+import type { ConfigView, ProviderView } from './types';
 
 const configPath = () => path.join(app.getPath('userData'), 'plugin-data', 'voiden-vault-secrets', 'config.json');
 
-function sanitize(input: Partial<VaultSettings>): VaultSettings {
-  const s = { ...DEFAULT_SETTINGS, ...input };
-  return {
-    address: String(s.address ?? '').trim(),
-    namespace: String(s.namespace ?? '').trim(),
-    mount: String(s.mount ?? '').trim() || DEFAULT_SETTINGS.mount,
-    kvVersion: Number(s.kvVersion) === 1 ? 1 : 2,
-    defaultPath: String(s.defaultPath ?? '').trim(),
-    cacheTtlSeconds: Math.max(0, Math.floor(Number(s.cacheTtlSeconds) || 0)),
-  };
-}
+const secretFields = (id: ProviderId) => providerInfo(id).fields.filter((f) => f.type === 'secret').map((f) => f.key);
 
-export function createConfigStore() {
-  let settings: VaultSettings = { ...DEFAULT_SETTINGS };
-  let token: string | undefined;
-  let encryptedToken: string | undefined;
+export function createConfigStore(): SecretsStore & {
+  saveProvider(id: ProviderId, settings?: Record<string, string>, secrets?: Record<string, string | null>): void;
+  saveGeneral(general: { cacheTtlSeconds?: number }): void;
+  describe(): Omit<ConfigView, 'providerApiAvailable' | 'status'>;
+} {
+  let config: StoredConfig = migrateConfig(undefined);
+  /** Decrypted secrets, keyed "<provider>.<field>". */
+  const secrets = new Map<string, string>();
 
   const encryptionAvailable = () => safeStorage.isEncryptionAvailable();
 
   function load() {
     try {
-      const raw: StoredConfig = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
-      settings = sanitize(raw.settings ?? {});
-      encryptedToken = raw.encryptedToken;
-      token = encryptedToken && encryptionAvailable()
-        ? safeStorage.decryptString(Buffer.from(encryptedToken, 'base64'))
-        : undefined;
+      config = migrateConfig(JSON.parse(fs.readFileSync(configPath(), 'utf8')));
     } catch {
-      // first run or unreadable file — start from defaults
+      return; // first run or unreadable file — start from defaults
+    }
+    if (!encryptionAvailable()) return;
+    for (const [key, value] of Object.entries(config.encrypted)) {
+      try {
+        secrets.set(key, safeStorage.decryptString(Buffer.from(value, 'base64')));
+      } catch {
+        delete config.encrypted[key]; // encrypted by another OS user or keychain — ask again
+      }
     }
   }
 
   function persist() {
     const file = configPath();
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const data: StoredConfig = { settings, ...(encryptedToken ? { encryptedToken } : {}) };
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
-  }
-
-  /** `nextToken`: undefined keeps the current token, null clears it, a string replaces it. */
-  function save(next: Partial<VaultSettings>, nextToken?: string | null) {
-    settings = sanitize({ ...settings, ...next });
-    if (nextToken === null || nextToken === '') {
-      token = undefined;
-      encryptedToken = undefined;
-    } else if (typeof nextToken === 'string') {
-      token = nextToken.trim();
-      encryptedToken = encryptionAvailable()
-        ? safeStorage.encryptString(token).toString('base64')
-        : undefined; // session-only: see header comment
-    }
-    persist();
+    fs.writeFileSync(file, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
   }
 
   load();
 
   return {
-    getSettings: () => settings,
-    getToken: () => token,
-    save,
-    /** What the settings page may see — never the token itself. */
-    describe: () => ({
-      settings,
-      hasToken: !!token,
-      tokenPersisted: !!encryptedToken,
-      encryptionAvailable: encryptionAvailable(),
-    }),
+    getProvider(id) {
+      const own: Record<string, string> = {};
+      for (const field of secretFields(id)) {
+        const value = secrets.get(`${id}.${field}`);
+        if (value) own[field] = value;
+      }
+      return { settings: config.providers[id], secrets: own };
+    },
+
+    getCacheTtlSeconds: () => config.cacheTtlSeconds,
+
+    /** For each secret: a string replaces it, null or "" removes it, absent keeps it. */
+    saveProvider(id, settings, nextSecrets = {}) {
+      if (settings) config.providers[id] = sanitizeSettings(id, settings);
+      for (const field of secretFields(id)) {
+        if (!(field in nextSecrets)) continue;
+        const key = `${id}.${field}`;
+        const value = nextSecrets[field]?.trim();
+        if (!value) {
+          secrets.delete(key);
+          delete config.encrypted[key];
+        } else {
+          secrets.set(key, value);
+          if (encryptionAvailable()) config.encrypted[key] = safeStorage.encryptString(value).toString('base64');
+          else delete config.encrypted[key]; // session-only: see header comment
+        }
+      }
+      persist();
+    },
+
+    saveGeneral(general) {
+      if (general.cacheTtlSeconds !== undefined) config.cacheTtlSeconds = sanitizeTtl(general.cacheTtlSeconds);
+      persist();
+    },
+
+    /** What the settings page may see — never a secret value. */
+    describe() {
+      const providers = {} as Record<ProviderId, ProviderView>;
+      for (const p of PROVIDERS) {
+        providers[p.id] = {
+          settings: config.providers[p.id],
+          secrets: Object.fromEntries(
+            secretFields(p.id).map((field) => {
+              const key = `${p.id}.${field}`;
+              return [field, !secrets.has(key) ? 'none' : config.encrypted[key] ? 'saved' : 'session'];
+            }),
+          ),
+        };
+      }
+      return { cacheTtlSeconds: config.cacheTtlSeconds, encryptionAvailable: encryptionAvailable(), providers };
+    },
   };
 }

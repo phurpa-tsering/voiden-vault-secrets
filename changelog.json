@@ -1,5 +1,26 @@
 [
   {
+    "version": "1.1.0",
+    "date": "2026-10-29",
+    "title": "Doppler, Infisical, Bitwarden and KeePassXC",
+    "description": "Four more secret managers, a secret browser and a redesigned settings page.",
+    "changes": {
+      "Added": [
+        "{{doppler.*}} references from Doppler configs (service or personal token)",
+        "{{infisical.*}} references from Infisical (Universal Auth machine identity or access token), with folders and imports",
+        "{{bitwarden.*}} references from the Bitwarden password manager via bw serve, with unlock, lock and sync from the settings page",
+        "{{keepass.*}} references from KeePassXC databases via keepassxc-cli (password and/or key file, TOTP)",
+        "Browse secrets tab: find a secret and copy its reference; values are never shown",
+        "Test connection now tests the form as typed, before saving",
+        "Per-provider status in the settings sidebar, updated by real requests"
+      ],
+      "Changed": [
+        "Redesigned settings page: provider sidebar, Connection / Browse secrets / How to use tabs, unsaved-changes tracking, \u2318S / Ctrl+S to save",
+        "Settings from 1.0.x (Vault address, token, cache) are migrated automatically"
+      ]
+    }
+  },
+  {
     "version": "1.0.0",
     "date": "2026-10-28",
     "title": "Initial release",
